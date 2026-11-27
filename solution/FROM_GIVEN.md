@@ -1,27 +1,65 @@
-# mini_serv — 配布コードを最大限残す解法
+# Exam06 mini_serv — 配布コードから完成させる全手順
 
-[配布コード](../subject/give_main.c) / [完成コード](mini_serv_from_given.c) / [問題文](../subject/subject.txt)
+[問題文](../subject/subject.txt) / [配布コード](../subject/give_main.c) / [完成コード](mini_serv_from_given.c)
 
-ゼロから書く mini_serv.c とは独立した解法。配布コードの extract_message、str_join、sockaddr_in、socket、bzero、IP、bind、listen、accept の呼び出しを再利用する。追加する補助関数は fatal と broadcast の2つのみ。送受信処理は main の select ループに直接書く。
+この文書だけを読んで、配布された main.c から提出用 mini_serv.c を完成させる。ゼロから書く mini_serv.c の解法を暗記する必要はない。配布コードの extract_message / str_join / socket / bzero / bind / listen / accept を最大限残す。
+
+## 0. 最初にやること
+
+### 試験本番
+
+ターミナルで現在地と配布ファイルを確認する。
 
 ```bash
-cp subject/give_main.c mini_serv.c
+pwd
+ls -la
 ```
 
-## STEP 1 — ヘッダー1行追加
+問題文に指定された提出ディレクトリに移動してから、配布された main.c を mini_serv.c にコピーする。既に mini_serv.c という名前ならコピー不要。実際の配布ファイル名・提出場所は試験画面に従う。
 
-sys/socket.h の直後に追加。
+```bash
+cp main.c mini_serv.c
+vim mini_serv.c
+```
+
+vim 以外の利用可能なエディタでもよい。
+
+### GitHubで練習する場合（本番では不要）
+
+```bash
+git clone https://github.com/yamato1936/42_exam06.git
+cd 42_exam06
+cp subject/give_main.c mini_serv.c
+vim mini_serv.c
+```
+
+すでに clone 済みなら git pull を使う。以下の STEP 1〜8 を実行する。変更不要な箇所は触らない。
+
+## 1. ヘッダー1行だけ追加
+
+`#include <sys/socket.h>` を探し、その下に次の1行を追加する。
 
 ```c
 #include <sys/select.h>
 ```
 
+既存ヘッダーは全て残す。select、fd_set、FD_ZERO / FD_SET / FD_ISSET / FD_CLR を使用するため。
 
-## STEP 2 — 配布の2関数は何も変更しない
+## 2. extract_message と str_join は完全にそのまま
 
-extract_message は受信文字列から改行までを取り出す（1: 成功、0: 改行なし、-1: malloc/calloc 失敗）。str_join は文字列を連結し、旧バッファを解放する。
+配布済みの2関数を削除・修正しない。
 
-## STEP 3 — main の直前にこれだけ追加
+| 関数 | 動作 |
+|---|---|
+| extract_message(&in[fd], &msg) | 最初の改行までを msg に移し、残りを in[fd] に保持する |
+| str_join(in[fd], buf) | 受信済み文字列に新しい文字列を連結する。成功時に元の文字列を free |
+| str_join(out[fd], msg) | 送信待ち文字列の末尾に新しい通知・メッセージを追加する |
+
+extract_message の戻り値 1 は成功、0 は改行なし、-1 は確保失敗。切り出した msg は呼び出し側で free する。
+
+## 3. main の直前（str_join の閉じ括弧の後）に追加
+
+次のコード全文を追加する。既存の main はまだ消さない。
 
 ```c
 fd_set live;
@@ -46,11 +84,22 @@ void broadcast(int from, char *msg)
 }
 ```
 
-live は接続済みのFD集合。in は未完成の受信行、out は送信待ちデータ。sockfd をグローバルに移すことで broadcast からサーバーFDを除外できる。グローバル変数はゼロ初期化。broadcast は送信元を除く接続中クライアントの out に追記する。
+### 何を覚えるか
 
-## STEP 4 — main の冒頭を変更
+- live: サーバーと現在接続しているクライアントのFD集合。
+- sockfd: リスニング用FD。main からグローバルへ移す。
+- maxfd: これまで登録した最大FD。切断後も大きい値のままで問題ない。
+- next_id: 新規クライアントのID。0から増え続ける。
+- id[fd]: FDとクライアント番号の対応。FDは再利用されてもIDは増える。
+- in[fd]: 未完成の受信行。out[fd]: まだ送信していない文字列。
+- fatal: stderr に Fatal error と改行を出し、終了コード1で終了。
+- broadcast: サーバー自身と送信元を除いた全クライアントの out に追加。ここで send を直接呼ばない。
 
-**変更前**
+グローバル変数は自動的にゼロ初期化されるので、配列を初期化するコードは不要。
+
+## 4. main 冒頭を変更
+
+**変更前（この範囲を選択）**
 
 ```c
 int main() {
@@ -58,7 +107,7 @@ int main() {
 	struct sockaddr_in servaddr, cli;
 ```
 
-**変更後**
+**変更後（これに置換）**
 
 ```c
 int main(int ac, char **av) {
@@ -72,12 +121,13 @@ int main(int ac, char **av) {
 	}
 ```
 
+sockfd をグローバルにしたのでローカル宣言から削除する。connfd と cli は残す。len は accept の引数型に合わせて socklen_t に変更。引数が1つでなければ stderr に指定メッセージを出す。
 
-sockfd は STEP 3 へ移動した。connfd、cli はそのまま。accept の第3引数の型に合わせて len を socklen_t にする。
+## 5. socket のエラー処理を変更
 
-## STEP 5 — socket のエラー表示だけ変更
+socket の呼び出し行と bzero は残す。その間だけ置換する。
 
-**変更前**
+**変更前（この範囲を選択）**
 
 ```c
 	if (sockfd == -1) { 
@@ -88,7 +138,7 @@ sockfd は STEP 3 へ移動した。connfd、cli はそのまま。accept の第
 		printf("Socket successfully created..\n");
 ```
 
-**変更後**
+**変更後（これに置換）**
 
 ```c
 	if (sockfd == -1 || sockfd >= FD_SETSIZE) {
@@ -96,29 +146,27 @@ sockfd は STEP 3 へ移動した。connfd、cli はそのまま。accept の第
 	}
 ```
 
+成功時に printf してはいけない。FD_SETSIZE を超えないことも確認する。
 
-socket の呼び出しと bzero はそのまま。成功時の printf は削除する。
+## 6. ポート番号だけ変更
 
-## STEP 6 — 固定ポートを書き換える
-
-**変更前**
-
-```c
-htons(8081)
-```
-
-**変更後**
+**変更前（この範囲を選択）**
 
 ```c
-htons(atoi(av[1]))
+	servaddr.sin_port = htons(8081);
 ```
 
+**変更後（これに置換）**
 
-127.0.0.1 の設定を変更しない。
+```c
+	servaddr.sin_port = htons(atoi(av[1]));
+```
 
-## STEP 7 — bind と listen は残してエラー処理だけ変更
+その上にある servaddr.sin_family と servaddr.sin_addr.s_addr の2行は変更しない。2130706433 は 127.0.0.1。
 
-**変更前**
+## 7. bind / listen のエラー処理だけ変更
+
+**変更前（この範囲を選択）**
 
 ```c
 	if ((bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr))) != 0) { 
@@ -133,7 +181,7 @@ htons(atoi(av[1]))
 	}
 ```
 
-**変更後**
+**変更後（これに置換）**
 
 ```c
 	if ((bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr))) != 0) {
@@ -144,14 +192,13 @@ htons(atoi(av[1]))
 	}
 ```
 
+呼び出しと条件式は元のまま。listen の backlog 10 もそのまま。ここまででサーバー初期化が完成する。
 
-bind と listen の条件式は配布のまま。listen の backlog 10 も維持する。
+## 8. 単発 accept を select ループに置換（最重要）
 
-## STEP 8 — 単発 accept 部分を select ループに置換
+### 8.0 削除する箇所
 
-main の末尾の閉じ括弧は残す。
-
-**変更前**
+listen のエラー処理より後の、以下の部分だけ削除する。main の最後の閉じ括弧は残す。
 
 ```c
 	len = sizeof(cli);
@@ -164,7 +211,125 @@ main の末尾の閉じ括弧は残す。
         printf("server acccept the client...\n");
 ```
 
-**変更後**
+削除した場所に次の4ブロックを **順番通りに連続して** 書く。8.1〜8.4 は途中で括弧が閉じていないため、全部書いてからコンパイルする。最後の main の閉じ括弧は既存のものを使用する。
+
+### 8.1 — select の準備
+
+```c
+	maxfd = sockfd;
+	FD_ZERO(&live);
+	FD_SET(sockfd, &live);
+	while (1)
+	{
+		fd_set rd = live, wr;
+		FD_ZERO(&wr);
+		for (int fd = 0; fd <= maxfd; fd++)
+			if (out[fd])
+				FD_SET(fd, &wr);
+		if (select(maxfd + 1, &rd, &wr, NULL, NULL) < 0)
+			fatal();
+		for (int fd = 0; fd <= maxfd; fd++)
+		{
+			char buf[4097], *msg;
+```
+
+まず sockfd を live に登録。while の各周回で rd と wr を作り直す。select は集合を変更するため live を直接渡さない。out があるときだけ書き込み監視することで、何もないときの無駄なループを避ける。
+
+### 8.2 — send：書き込みできるクライアントへ送信
+
+8.1 の char buf 宣言の直後に追加する。
+
+```c
+			if (FD_ISSET(fd, &wr))
+			{
+				int n = send(fd, out[fd], strlen(out[fd]), MSG_DONTWAIT | MSG_NOSIGNAL);
+				if (n > 0)
+				{
+					int i = 0;
+					while ((out[fd][i] = out[fd][i + n]) != 0)
+						i++;
+					if (!out[fd][0])
+					{
+						free(out[fd]);
+						out[fd] = NULL;
+					}
+				}
+			}
+```
+
+send が返す n は実際に送ったバイト数。送信バッファの先頭 n バイトだけを取り除く。例えば ABCDE を3バイト送ったら DE と終端NULを前方へ詰める。全て送れたら free と NULL。送れなかったときはデータを保持し、遅いクライアントを切断しない。MSG_DONTWAIT と MSG_NOSIGNAL は Linux の send フラグ。
+
+### 8.3 — accept：新規接続
+
+8.2 の直後に追加する。
+
+```c
+			if (!FD_ISSET(fd, &rd))
+				continue;
+			if (fd == sockfd)
+			{
+				len = sizeof(cli);
+				connfd = accept(sockfd, (struct sockaddr *)&cli, &len);
+				if (connfd < 0)
+					continue;
+				if (connfd >= FD_SETSIZE)
+				{
+					close(connfd);
+					continue;
+				}
+				if (connfd > maxfd)
+					maxfd = connfd;
+				FD_SET(connfd, &live);
+				id[connfd] = next_id++;
+				sprintf(buf, "server: client %d just arrived\n", id[connfd]);
+				broadcast(connfd, buf);
+			}
+```
+
+rd にないFDは recv / accept しない。sockfd が読み取り可能なら新規接続なので、配布コードの len = sizeof(cli) と accept の2行を再利用。FD登録 → ID割当 → 到着通知の順。初回IDは0。新規クライアント自身には到着通知を送らない。
+
+### 8.4 — recv：受信・切断・行ごとの配信
+
+8.3 の直後に追加する。以下の末尾で else、for、while を閉じる。その後に既存の main の閉じ括弧が1つあることを確認する。
+
+```c
+			else
+			{
+				int n = recv(fd, buf, sizeof(buf) - 1, 0);
+				if (n <= 0)
+				{
+					FD_CLR(fd, &live);
+					sprintf(buf, "server: client %d just left\n", id[fd]);
+					broadcast(fd, buf);
+					close(fd);
+					free(in[fd]);
+					free(out[fd]);
+					in[fd] = out[fd] = NULL;
+					continue;
+				}
+				buf[n] = 0;
+				in[fd] = str_join(in[fd], buf);
+				if (!in[fd])
+					fatal();
+				while ((n = extract_message(&in[fd], &msg)) > 0)
+				{
+					sprintf(buf, "client %d: ", id[fd]);
+					broadcast(fd, buf);
+					broadcast(fd, msg);
+					free(msg);
+				}
+				if (n < 0)
+					fatal();
+			}
+		}
+	}
+```
+
+recv が0以下なら切断処理。live から削除、通知、close、両バッファ free、NULL にする。正の値なら NUL 終端してから str_join する。extract_message を繰り返すことで複数行・分割された行にも対応する。各行に client ID を付けて送信元以外に配信する。メモリ確保失敗は fatal。
+
+### 8.5 — select ループ全体（括弧確認用）
+
+8.1〜8.4 を連結したもの。二重に追加しない。
 
 ```c
 	maxfd = sockfd;
@@ -249,29 +414,395 @@ main の末尾の閉じ括弧は残す。
 	}
 ```
 
+この直後に main の閉じ括弧が1つ必要。
 
-上のループを4ブロックとして覚える。
+## 9. コンパイル
 
-1. **準備**: live を rd にコピー。out があるクライアントだけ wr に登録し select を呼ぶ。
-2. **send**: wr に含まれるFDのみ送信。送信できた n バイトだけを取り除く。未送信データを捨てず、空になったら free。文字列を前方へ詰めるループは終端 NUL もコピーするため、重なる領域に対する strcpy は不要。
-3. **accept**: 配布の len = sizeof(cli) と accept の2行をそのまま再利用。IDを割り当てて到着通知。
-4. **recv**: 切断なら FD_CLR、通知、close、free。受信できたら str_join、extract_message、行ごとの prefix と broadcast。最後に確保失敗を判定する。
+```bash
+cc -Wall -Wextra -Werror mini_serv.c -o mini_serv
+```
 
-注意: 送信元にも同じメッセージを送らない。送信できないだけで切断しない。select の集合は毎回作り直す。FD_SETSIZE 以上を FD_SET しない。
+エラーがなければ実行ファイルが作られる。エラーが出たら表示された行番号の少し前から確認する。
 
-## STEP 9 — 差分確認とテスト
+| エラー例 | 確認する場所 |
+|---|---|
+| unknown type name fd_set | STEP 1 のヘッダー |
+| conflicting types / pointer-sign accept | STEP 4 の socklen_t len |
+| undeclared identifier sockfd | STEP 3 のグローバル |
+| expected declaration or statement at end of input | STEP 8 の閉じ括弧 |
+| unused variable | 元の宣言や不要なコードが残っていないか |
+
+練習時は完成コードと比較できる。
 
 ```bash
 diff -u subject/give_main.c mini_serv.c
 diff -u solution/mini_serv_from_given.c mini_serv.c
-cc -Wall -Wextra -Werror mini_serv.c -o mini_serv
+```
+
+後者の差分が空なら完全一致。空白の差だけなら動作上は問題ない。
+
+## 10. 動作確認（端末を4つ開く）
+
+### 10.1 引数なし・エラー時
+
+```bash
+./mini_serv
+echo $?
+```
+
+期待する表示: Wrong number of arguments、終了コード1。
+
+### 10.2 端末A: サーバー
+
+```bash
 ./mini_serv 8081
 ```
 
-別々の端末で nc 127.0.0.1 8081 を実行。接続・複数行・分割受信・切断・再接続・遅い読み取り側を確認する。
+正常なら何も出力せず待機する。
 
-同等のローカル実装で厳格コンパイル、引数なし、3クライアント、分割受信と別クライアントからの送信、複数行、切断、再接続時のID増加を確認済み。公式テスターおよび大規模な低速クライアント負荷試験は未実施。Linux の MSG_DONTWAIT / MSG_NOSIGNAL を使用する。文字列連結によるコピーコストは残る。
+### 10.3 端末B: client 0
 
-## 暗記対象
+```bash
+nc 127.0.0.1 8081
+```
 
-グローバル変数、fatal、broadcast、select ループ。既存の文字列処理・ソケット初期化・accept を書き直さない。完成コードと同じ空白やコメントにする必要はない。
+### 10.4 端末C: client 1
+
+```bash
+nc 127.0.0.1 8081
+```
+
+Bに `server: client 1 just arrived` が表示される。C自身には表示されない。
+
+### 10.5 端末D: client 2
+
+```bash
+nc 127.0.0.1 8081
+```
+
+BとCに `server: client 2 just arrived` が表示される。
+
+### 10.6 メッセージ
+
+Cで hello と入力してEnter。BとDの期待出力:
+
+```text
+client 1: hello
+```
+
+Cにはサーバーからのエコーがない（ターミナル自身の入力表示は別）。複数行を貼り付けて全行に prefix がつくことも確認。
+
+### 10.7 切断と再接続
+
+Cで Ctrl+C。BとDの期待出力:
+
+```text
+server: client 1 just left
+```
+
+Cで nc を再実行するとBとDに `server: client 3 just arrived` が表示される。FDが再利用されてもIDは3。
+
+### 10.8 bind エラー
+
+サーバーAを起動したまま別端末から同じポートで実行。
+
+```bash
+./mini_serv 8081
+echo $?
+```
+
+期待出力は Fatal error、終了コード1。
+
+## 11. 自動通信テスト（練習用・Python 3、外部ライブラリ不要）
+
+以下はリポジトリのルートで実行する。試験の提出コードに Python は含めない。手動テストのサーバーは先に止める。
+
+```bash
+python3 - <<'PY'
+import socket, subprocess, time
+
+with socket.socket() as tmp:
+    tmp.bind(("127.0.0.1", 0))
+    port = tmp.getsockname()[1]
+p = subprocess.Popen(["./mini_serv", str(port)])
+clients = []
+def connect():
+    for _ in range(100):
+        try:
+            s = socket.create_connection(("127.0.0.1", port), timeout=1)
+            s.settimeout(2)
+            clients.append(s)
+            return s
+        except ConnectionRefusedError:
+            time.sleep(0.02)
+    raise RuntimeError("server not ready")
+def expect(s, expected):
+    expected = expected.encode()
+    got = b""
+    while len(got) < len(expected):
+        chunk = s.recv(len(expected) - len(got))
+        if not chunk:
+            raise AssertionError("unexpected EOF")
+        got += chunk
+    assert got == expected, (got, expected)
+try:
+    a, b = connect(), connect()
+    expect(a, "server: client 1 just arrived\n")
+    c = connect()
+    for s in (a, b):
+        expect(s, "server: client 2 just arrived\n")
+    b.sendall(b"hello\nworld\n")
+    for s in (a, c):
+        expect(s, "client 1: hello\nclient 1: world\n")
+    b.sendall(b"part")
+    time.sleep(0.05)
+    c.sendall(b"other\n")
+    for s in (a, b):
+        expect(s, "client 2: other\n")
+    b.sendall(b"ial\n")
+    for s in (a, c):
+        expect(s, "client 1: partial\n")
+    b.close()
+    for s in (a, c):
+        expect(s, "server: client 1 just left\n")
+    d = connect()
+    for s in (a, c):
+        expect(s, "server: client 3 just arrived\n")
+    print("PASS: connect, multiline, fragmented lines, disconnect, reconnect")
+finally:
+    for s in clients:
+        s.close()
+    p.terminate()
+    p.wait()
+PY
+```
+
+このテストは基本通信のみ。低速クライアント・部分送信・メモリリークの網羅的検証や公式テスターの代替ではない。
+
+## 12. 提出直前チェック
+
+- [ ] 提出ファイル名が mini_serv.c
+- [ ] 指定のディレクトリに配置
+- [ ] cc -Wall -Wextra -Werror でコンパイル
+- [ ] 引数エラー、Fatal error の文言・改行・終了コード
+- [ ] 127.0.0.1 のみに bind
+- [ ] printf、fcntl、独自の #define を追加していない
+- [ ] select の後に accept / recv / send
+- [ ] 送信元に配信しない
+- [ ] 各行に client ID を付ける
+- [ ] 遅い受信側の送信データを捨てない
+- [ ] 切断時に FD_CLR / close / free / NULL
+- [ ] 余計な実行ファイルやテストコードを提出しない
+
+試験の提出コマンド・操作は実際の試験画面の指示に従う。
+
+## 13. 30分で書く練習用の時間配分（目安）
+
+| 時間 | 内容 |
+|---|---|
+| 0〜3分 | ファイル確認・コピー・ヘッダー |
+| 3〜7分 | グローバル・fatal・broadcast |
+| 7〜10分 | main の引数・socket・ポート・bind・listen |
+| 10〜22分 | select、send、accept、recv |
+| 22〜26分 | コンパイルエラー修正 |
+| 26〜30分 | nc で確認、提出前チェック |
+
+## 14. 完成コード全文（参照用）
+
+STEP 1〜8を実施したときの最終形。既存のファイルに丸ごと追記するものではない。
+
+```c
+#include <errno.h>
+#include <string.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <netinet/in.h>
+
+int extract_message(char **buf, char **msg)
+{
+	char	*newbuf;
+	int	i;
+
+	*msg = 0;
+	if (*buf == 0)
+		return (0);
+	i = 0;
+	while ((*buf)[i])
+	{
+		if ((*buf)[i] == '\n')
+		{
+			newbuf = calloc(1, sizeof(*newbuf) * (strlen(*buf + i + 1) + 1));
+			if (newbuf == 0)
+				return (-1);
+			strcpy(newbuf, *buf + i + 1);
+			*msg = *buf;
+			(*msg)[i + 1] = 0;
+			*buf = newbuf;
+			return (1);
+		}
+		i++;
+	}
+	return (0);
+}
+
+char *str_join(char *buf, char *add)
+{
+	char	*newbuf;
+	int		len;
+
+	if (buf == 0)
+		len = 0;
+	else
+		len = strlen(buf);
+	newbuf = malloc(sizeof(*newbuf) * (len + strlen(add) + 1));
+	if (newbuf == 0)
+		return (0);
+	newbuf[0] = 0;
+	if (buf != 0)
+		strcat(newbuf, buf);
+	free(buf);
+	strcat(newbuf, add);
+	return (newbuf);
+}
+
+
+fd_set live;
+int sockfd, maxfd, next_id, id[FD_SETSIZE];
+char *in[FD_SETSIZE], *out[FD_SETSIZE];
+
+void fatal(void)
+{
+	write(2, "Fatal error\n", 12);
+	exit(1);
+}
+
+void broadcast(int from, char *msg)
+{
+	for (int fd = 0; fd <= maxfd; fd++)
+		if (fd != sockfd && fd != from && FD_ISSET(fd, &live))
+		{
+			out[fd] = str_join(out[fd], msg);
+			if (!out[fd])
+				fatal();
+		}
+}
+
+int main(int ac, char **av) {
+	int connfd;
+	socklen_t len;
+	struct sockaddr_in servaddr, cli;
+
+	if (ac != 2) {
+		write(2, "Wrong number of arguments\n", 26);
+		return 1;
+	} 
+
+	// socket create and verification 
+	sockfd = socket(AF_INET, SOCK_STREAM, 0); 
+	if (sockfd == -1 || sockfd >= FD_SETSIZE) {
+		fatal();
+	}
+	bzero(&servaddr, sizeof(servaddr)); 
+
+	// assign IP, PORT 
+	servaddr.sin_family = AF_INET; 
+	servaddr.sin_addr.s_addr = htonl(2130706433); //127.0.0.1
+	servaddr.sin_port = htons(atoi(av[1])); 
+
+	// Binding newly created socket to given IP and verification 
+	if ((bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr))) != 0) {
+		fatal();
+	}
+	if (listen(sockfd, 10) != 0) {
+		fatal();
+	}
+	maxfd = sockfd;
+	FD_ZERO(&live);
+	FD_SET(sockfd, &live);
+	while (1)
+	{
+		fd_set rd = live, wr;
+		FD_ZERO(&wr);
+		for (int fd = 0; fd <= maxfd; fd++)
+			if (out[fd])
+				FD_SET(fd, &wr);
+		if (select(maxfd + 1, &rd, &wr, NULL, NULL) < 0)
+			fatal();
+		for (int fd = 0; fd <= maxfd; fd++)
+		{
+			char buf[4097], *msg;
+			if (FD_ISSET(fd, &wr))
+			{
+				int n = send(fd, out[fd], strlen(out[fd]), MSG_DONTWAIT | MSG_NOSIGNAL);
+				if (n > 0)
+				{
+					int i = 0;
+					while ((out[fd][i] = out[fd][i + n]) != 0)
+						i++;
+					if (!out[fd][0])
+					{
+						free(out[fd]);
+						out[fd] = NULL;
+					}
+				}
+			}
+			if (!FD_ISSET(fd, &rd))
+				continue;
+			if (fd == sockfd)
+			{
+				len = sizeof(cli);
+				connfd = accept(sockfd, (struct sockaddr *)&cli, &len);
+				if (connfd < 0)
+					continue;
+				if (connfd >= FD_SETSIZE)
+				{
+					close(connfd);
+					continue;
+				}
+				if (connfd > maxfd)
+					maxfd = connfd;
+				FD_SET(connfd, &live);
+				id[connfd] = next_id++;
+				sprintf(buf, "server: client %d just arrived\n", id[connfd]);
+				broadcast(connfd, buf);
+			}
+			else
+			{
+				int n = recv(fd, buf, sizeof(buf) - 1, 0);
+				if (n <= 0)
+				{
+					FD_CLR(fd, &live);
+					sprintf(buf, "server: client %d just left\n", id[fd]);
+					broadcast(fd, buf);
+					close(fd);
+					free(in[fd]);
+					free(out[fd]);
+					in[fd] = out[fd] = NULL;
+					continue;
+				}
+				buf[n] = 0;
+				in[fd] = str_join(in[fd], buf);
+				if (!in[fd])
+					fatal();
+				while ((n = extract_message(&in[fd], &msg)) > 0)
+				{
+					sprintf(buf, "client %d: ", id[fd]);
+					broadcast(fd, buf);
+					broadcast(fd, msg);
+					free(msg);
+				}
+				if (n < 0)
+					fatal();
+			}
+		}
+	}
+}
+```
+
+## 検証状況・制約
+
+この文書の置換手順を機械的に適用すると、現在の GitHub の mini_serv_from_given.c と完全一致することを確認済み。今回の更新は Markdown のみで、Cソースの再コンパイル・通信テスト・公式テスター実行はしていない。上のテストを実際の環境で実行して確認すること。文字列連結のコピーコストや Linux 固有の send フラグは従来の解答と同じ。
