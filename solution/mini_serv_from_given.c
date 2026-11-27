@@ -56,7 +56,7 @@ char *str_join(char *buf, char *add)
 }
 
 
-fd_set live;
+fd_set live, pending;
 int sockfd, maxfd, next_id, id[FD_SETSIZE];
 char *in[FD_SETSIZE], *out[FD_SETSIZE];
 
@@ -71,10 +71,61 @@ void broadcast(int from, char *msg)
 	for (int fd = 0; fd <= maxfd; fd++)
 		if (fd != sockfd && fd != from && FD_ISSET(fd, &live))
 		{
-			out[fd] = str_join(out[fd], msg);
-			if (!out[fd])
+			if (!(out[fd] = str_join(out[fd], msg)))
 				fatal();
+			FD_SET(fd, &pending);
 		}
+}
+
+void notice(int fd, char *format)
+{
+	char buf[64];
+	sprintf(buf, format, id[fd]);
+	broadcast(fd, buf);
+}
+
+void flush(int fd)
+{
+	int n = send(fd, out[fd], strlen(out[fd]), MSG_DONTWAIT | MSG_NOSIGNAL);
+	if (n <= 0)
+		return;
+	int i = 0;
+	while ((out[fd][i] = out[fd][i + n]) != 0)
+		i++;
+	if (!i)
+	{
+		free(out[fd]);
+		out[fd] = NULL;
+		FD_CLR(fd, &pending);
+	}
+}
+
+void receive(int fd)
+{
+	char buf[4097], *msg;
+	int n = recv(fd, buf, sizeof(buf) - 1, 0);
+	if (n <= 0)
+	{
+		FD_CLR(fd, &live);
+		FD_CLR(fd, &pending);
+		notice(fd, "server: client %d just left\n");
+		close(fd);
+		free(in[fd]);
+		free(out[fd]);
+		in[fd] = out[fd] = NULL;
+		return;
+	}
+	buf[n] = 0;
+	if (!(in[fd] = str_join(in[fd], buf)))
+		fatal();
+	while ((n = extract_message(&in[fd], &msg)) > 0)
+	{
+		notice(fd, "client %d: ");
+		broadcast(fd, msg);
+		free(msg);
+	}
+	if (n < 0)
+		fatal();
 }
 
 int main(int ac, char **av) {
@@ -85,60 +136,40 @@ int main(int ac, char **av) {
 	if (ac != 2) {
 		write(2, "Wrong number of arguments\n", 26);
 		return 1;
-	} 
-
-	// socket create and verification 
-	sockfd = socket(AF_INET, SOCK_STREAM, 0); 
-	if (sockfd == -1 || sockfd >= FD_SETSIZE) {
-		fatal();
 	}
-	bzero(&servaddr, sizeof(servaddr)); 
 
-	// assign IP, PORT 
-	servaddr.sin_family = AF_INET; 
+	// socket create and verification
+	sockfd = socket(AF_INET, SOCK_STREAM, 0);
+	if (sockfd == -1 || sockfd >= FD_SETSIZE)
+		fatal();
+	bzero(&servaddr, sizeof(servaddr));
+
+	// assign IP, PORT
+	servaddr.sin_family = AF_INET;
 	servaddr.sin_addr.s_addr = htonl(2130706433); //127.0.0.1
-	servaddr.sin_port = htons(atoi(av[1])); 
+	servaddr.sin_port = htons(atoi(av[1]));
 
-	// Binding newly created socket to given IP and verification 
-	if ((bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr))) != 0) {
+	// Binding newly created socket to given IP and verification
+	if ((bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr))) != 0 || listen(sockfd, 10) != 0)
 		fatal();
-	}
-	if (listen(sockfd, 10) != 0) {
-		fatal();
-	}
 	maxfd = sockfd;
 	FD_ZERO(&live);
+	FD_ZERO(&pending);
 	FD_SET(sockfd, &live);
 	while (1)
 	{
-		fd_set rd = live, wr;
-		FD_ZERO(&wr);
-		for (int fd = 0; fd <= maxfd; fd++)
-			if (out[fd])
-				FD_SET(fd, &wr);
+		fd_set rd = live, wr = pending;
 		if (select(maxfd + 1, &rd, &wr, NULL, NULL) < 0)
 			fatal();
 		for (int fd = 0; fd <= maxfd; fd++)
 		{
-			char buf[4097], *msg;
 			if (FD_ISSET(fd, &wr))
-			{
-				int n = send(fd, out[fd], strlen(out[fd]), MSG_DONTWAIT | MSG_NOSIGNAL);
-				if (n > 0)
-				{
-					int i = 0;
-					while ((out[fd][i] = out[fd][i + n]) != 0)
-						i++;
-					if (!out[fd][0])
-					{
-						free(out[fd]);
-						out[fd] = NULL;
-					}
-				}
-			}
+				flush(fd);
 			if (!FD_ISSET(fd, &rd))
 				continue;
-			if (fd == sockfd)
+			if (fd != sockfd)
+				receive(fd);
+			else
 			{
 				len = sizeof(cli);
 				connfd = accept(sockfd, (struct sockaddr *)&cli, &len);
@@ -153,36 +184,7 @@ int main(int ac, char **av) {
 					maxfd = connfd;
 				FD_SET(connfd, &live);
 				id[connfd] = next_id++;
-				sprintf(buf, "server: client %d just arrived\n", id[connfd]);
-				broadcast(connfd, buf);
-			}
-			else
-			{
-				int n = recv(fd, buf, sizeof(buf) - 1, 0);
-				if (n <= 0)
-				{
-					FD_CLR(fd, &live);
-					sprintf(buf, "server: client %d just left\n", id[fd]);
-					broadcast(fd, buf);
-					close(fd);
-					free(in[fd]);
-					free(out[fd]);
-					in[fd] = out[fd] = NULL;
-					continue;
-				}
-				buf[n] = 0;
-				in[fd] = str_join(in[fd], buf);
-				if (!in[fd])
-					fatal();
-				while ((n = extract_message(&in[fd], &msg)) > 0)
-				{
-					sprintf(buf, "client %d: ", id[fd]);
-					broadcast(fd, buf);
-					broadcast(fd, msg);
-					free(msg);
-				}
-				if (n < 0)
-					fatal();
+				notice(connfd, "server: client %d just arrived\n");
 			}
 		}
 	}
