@@ -62,7 +62,7 @@ extract_message の戻り値 1 は成功、0 は改行なし、-1 は確保失�
 次のコード全文を追加する。既存の main はまだ消さない。
 
 ```c
-fd_set live;
+fd_set live, pending;
 int sockfd, maxfd, next_id, id[FD_SETSIZE];
 char *in[FD_SETSIZE], *out[FD_SETSIZE];
 
@@ -77,16 +77,68 @@ void broadcast(int from, char *msg)
 	for (int fd = 0; fd <= maxfd; fd++)
 		if (fd != sockfd && fd != from && FD_ISSET(fd, &live))
 		{
-			out[fd] = str_join(out[fd], msg);
-			if (!out[fd])
+			if (!(out[fd] = str_join(out[fd], msg)))
 				fatal();
+			FD_SET(fd, &pending);
 		}
+}
+
+void notice(int fd, char *format)
+{
+	char buf[64];
+	sprintf(buf, format, id[fd]);
+	broadcast(fd, buf);
+}
+
+void flush(int fd)
+{
+	int n = send(fd, out[fd], strlen(out[fd]), MSG_DONTWAIT | MSG_NOSIGNAL);
+	if (n <= 0)
+		return;
+	int i = 0;
+	while ((out[fd][i] = out[fd][i + n]) != 0)
+		i++;
+	if (!i)
+	{
+		free(out[fd]);
+		out[fd] = NULL;
+		FD_CLR(fd, &pending);
+	}
+}
+
+void receive(int fd)
+{
+	char buf[4097], *msg;
+	int n = recv(fd, buf, sizeof(buf) - 1, 0);
+	if (n <= 0)
+	{
+		FD_CLR(fd, &live);
+		FD_CLR(fd, &pending);
+		notice(fd, "server: client %d just left\n");
+		close(fd);
+		free(in[fd]);
+		free(out[fd]);
+		in[fd] = out[fd] = NULL;
+		return;
+	}
+	buf[n] = 0;
+	if (!(in[fd] = str_join(in[fd], buf)))
+		fatal();
+	while ((n = extract_message(&in[fd], &msg)) > 0)
+	{
+		notice(fd, "client %d: ");
+		broadcast(fd, msg);
+		free(msg);
+	}
+	if (n < 0)
+		fatal();
 }
 ```
 
 ### 何を覚えるか
 
 - live: サーバーと現在接続しているクライアントのFD集合。
+- pending: 未送信データがあるクライアントのFD集合。broadcast で登録し、flush で全送信後に解除する。
 - sockfd: リスニング用FD。main からグローバルへ移す。
 - maxfd: これまで登録した最大FD。切断後も大きい値のままで問題ない。
 - next_id: 新規クライアントのID。0から増え続ける。
@@ -94,6 +146,11 @@ void broadcast(int from, char *msg)
 - in[fd]: 未完成の受信行。out[fd]: まだ送信していない文字列。
 - fatal: stderr に Fatal error と改行を出し、終了コード1で終了。
 - broadcast: サーバー自身と送信元を除いた全クライアントの out に追加。ここで send を直接呼ばない。
+- notice: ID付きの接続・切断通知と行の接頭辞を作る。
+- flush: select で書き込み可能になったFDへ送信。部分送信の残りは保持する。
+- receive: recv、切断処理、行の抽出と配信を行う。
+
+main を短くするため補助関数を5個に分ける。コード全体の行数を減らすためではなく、イベントループを単純化するための分割。
 
 グローバル変数は自動的にゼロ初期化されるので、配列を初期化するコードは不要。
 
@@ -141,9 +198,8 @@ socket の呼び出し行と bzero は残す。その間だけ置換する。
 **変更後（これに置換）**
 
 ```c
-	if (sockfd == -1 || sockfd >= FD_SETSIZE) {
+	if (sockfd == -1 || sockfd >= FD_SETSIZE)
 		fatal();
-	}
 ```
 
 成功時に printf してはいけない。FD_SETSIZE を超えないことも確認する。
@@ -184,15 +240,11 @@ socket の呼び出し行と bzero は残す。その間だけ置換する。
 **変更後（これに置換）**
 
 ```c
-	if ((bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr))) != 0) {
+	if ((bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr))) != 0 || listen(sockfd, 10) != 0)
 		fatal();
-	}
-	if (listen(sockfd, 10) != 0) {
-		fatal();
-	}
 ```
 
-呼び出しと条件式は元のまま。listen の backlog 10 もそのまま。ここまででサーバー初期化が完成する。
+bind と listen を || でまとめる。bind が失敗したら listen は実行しない。listen の backlog 10 もそのまま。ここまででサーバー初期化が完成する。
 
 ## 8. 単発 accept を select ループに置換（最重要）
 
@@ -218,37 +270,22 @@ listen のエラー処理より後の、以下の部分だけ削除する。main
 ```c
 	maxfd = sockfd;
 	FD_ZERO(&live);
+	FD_ZERO(&pending);
 	FD_SET(sockfd, &live);
 	while (1)
 	{
-		fd_set rd = live, wr;
-		FD_ZERO(&wr);
-		for (int fd = 0; fd <= maxfd; fd++)
-			if (out[fd])
-				FD_SET(fd, &wr);
+		fd_set rd = live, wr = pending;
 		if (select(maxfd + 1, &rd, &wr, NULL, NULL) < 0)
 			fatal();
 		for (int fd = 0; fd <= maxfd; fd++)
 		{
-			char buf[4097], *msg;
 			if (FD_ISSET(fd, &wr))
-			{
-				int n = send(fd, out[fd], strlen(out[fd]), MSG_DONTWAIT | MSG_NOSIGNAL);
-				if (n > 0)
-				{
-					int i = 0;
-					while ((out[fd][i] = out[fd][i + n]) != 0)
-						i++;
-					if (!out[fd][0])
-					{
-						free(out[fd]);
-						out[fd] = NULL;
-					}
-				}
-			}
+				flush(fd);
 			if (!FD_ISSET(fd, &rd))
 				continue;
-			if (fd == sockfd)
+			if (fd != sockfd)
+				receive(fd);
+			else
 			{
 				len = sizeof(cli);
 				connfd = accept(sockfd, (struct sockaddr *)&cli, &len);
@@ -263,42 +300,15 @@ listen のエラー処理より後の、以下の部分だけ削除する。main
 					maxfd = connfd;
 				FD_SET(connfd, &live);
 				id[connfd] = next_id++;
-				sprintf(buf, "server: client %d just arrived\n", id[connfd]);
-				broadcast(connfd, buf);
-			}
-			else
-			{
-				int n = recv(fd, buf, sizeof(buf) - 1, 0);
-				if (n <= 0)
-				{
-					FD_CLR(fd, &live);
-					sprintf(buf, "server: client %d just left\n", id[fd]);
-					broadcast(fd, buf);
-					close(fd);
-					free(in[fd]);
-					free(out[fd]);
-					in[fd] = out[fd] = NULL;
-					continue;
-				}
-				buf[n] = 0;
-				in[fd] = str_join(in[fd], buf);
-				if (!in[fd])
-					fatal();
-				while ((n = extract_message(&in[fd], &msg)) > 0)
-				{
-					sprintf(buf, "client %d: ", id[fd]);
-					broadcast(fd, buf);
-					broadcast(fd, msg);
-					free(msg);
-				}
-				if (n < 0)
-					fatal();
+				notice(connfd, "server: client %d just arrived\n");
 			}
 		}
 	}
 ```
 
 この直後に main の閉じ括弧が1つ必要。
+
+select ループでは live と pending のコピーを渡すだけ。書き込み可能なら flush、クライアントが読み取り可能なら receive、サーバーが読み取り可能なら元の accept を実行する。
 
 ## 9. コンパイル
 
@@ -554,7 +564,7 @@ char *str_join(char *buf, char *add)
 }
 
 
-fd_set live;
+fd_set live, pending;
 int sockfd, maxfd, next_id, id[FD_SETSIZE];
 char *in[FD_SETSIZE], *out[FD_SETSIZE];
 
@@ -569,10 +579,61 @@ void broadcast(int from, char *msg)
 	for (int fd = 0; fd <= maxfd; fd++)
 		if (fd != sockfd && fd != from && FD_ISSET(fd, &live))
 		{
-			out[fd] = str_join(out[fd], msg);
-			if (!out[fd])
+			if (!(out[fd] = str_join(out[fd], msg)))
 				fatal();
+			FD_SET(fd, &pending);
 		}
+}
+
+void notice(int fd, char *format)
+{
+	char buf[64];
+	sprintf(buf, format, id[fd]);
+	broadcast(fd, buf);
+}
+
+void flush(int fd)
+{
+	int n = send(fd, out[fd], strlen(out[fd]), MSG_DONTWAIT | MSG_NOSIGNAL);
+	if (n <= 0)
+		return;
+	int i = 0;
+	while ((out[fd][i] = out[fd][i + n]) != 0)
+		i++;
+	if (!i)
+	{
+		free(out[fd]);
+		out[fd] = NULL;
+		FD_CLR(fd, &pending);
+	}
+}
+
+void receive(int fd)
+{
+	char buf[4097], *msg;
+	int n = recv(fd, buf, sizeof(buf) - 1, 0);
+	if (n <= 0)
+	{
+		FD_CLR(fd, &live);
+		FD_CLR(fd, &pending);
+		notice(fd, "server: client %d just left\n");
+		close(fd);
+		free(in[fd]);
+		free(out[fd]);
+		in[fd] = out[fd] = NULL;
+		return;
+	}
+	buf[n] = 0;
+	if (!(in[fd] = str_join(in[fd], buf)))
+		fatal();
+	while ((n = extract_message(&in[fd], &msg)) > 0)
+	{
+		notice(fd, "client %d: ");
+		broadcast(fd, msg);
+		free(msg);
+	}
+	if (n < 0)
+		fatal();
 }
 
 int main(int ac, char **av) {
@@ -583,60 +644,40 @@ int main(int ac, char **av) {
 	if (ac != 2) {
 		write(2, "Wrong number of arguments\n", 26);
 		return 1;
-	} 
-
-	// socket create and verification 
-	sockfd = socket(AF_INET, SOCK_STREAM, 0); 
-	if (sockfd == -1 || sockfd >= FD_SETSIZE) {
-		fatal();
 	}
-	bzero(&servaddr, sizeof(servaddr)); 
 
-	// assign IP, PORT 
-	servaddr.sin_family = AF_INET; 
+	// socket create and verification
+	sockfd = socket(AF_INET, SOCK_STREAM, 0);
+	if (sockfd == -1 || sockfd >= FD_SETSIZE)
+		fatal();
+	bzero(&servaddr, sizeof(servaddr));
+
+	// assign IP, PORT
+	servaddr.sin_family = AF_INET;
 	servaddr.sin_addr.s_addr = htonl(2130706433); //127.0.0.1
-	servaddr.sin_port = htons(atoi(av[1])); 
+	servaddr.sin_port = htons(atoi(av[1]));
 
-	// Binding newly created socket to given IP and verification 
-	if ((bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr))) != 0) {
+	// Binding newly created socket to given IP and verification
+	if ((bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr))) != 0 || listen(sockfd, 10) != 0)
 		fatal();
-	}
-	if (listen(sockfd, 10) != 0) {
-		fatal();
-	}
 	maxfd = sockfd;
 	FD_ZERO(&live);
+	FD_ZERO(&pending);
 	FD_SET(sockfd, &live);
 	while (1)
 	{
-		fd_set rd = live, wr;
-		FD_ZERO(&wr);
-		for (int fd = 0; fd <= maxfd; fd++)
-			if (out[fd])
-				FD_SET(fd, &wr);
+		fd_set rd = live, wr = pending;
 		if (select(maxfd + 1, &rd, &wr, NULL, NULL) < 0)
 			fatal();
 		for (int fd = 0; fd <= maxfd; fd++)
 		{
-			char buf[4097], *msg;
 			if (FD_ISSET(fd, &wr))
-			{
-				int n = send(fd, out[fd], strlen(out[fd]), MSG_DONTWAIT | MSG_NOSIGNAL);
-				if (n > 0)
-				{
-					int i = 0;
-					while ((out[fd][i] = out[fd][i + n]) != 0)
-						i++;
-					if (!out[fd][0])
-					{
-						free(out[fd]);
-						out[fd] = NULL;
-					}
-				}
-			}
+				flush(fd);
 			if (!FD_ISSET(fd, &rd))
 				continue;
-			if (fd == sockfd)
+			if (fd != sockfd)
+				receive(fd);
+			else
 			{
 				len = sizeof(cli);
 				connfd = accept(sockfd, (struct sockaddr *)&cli, &len);
@@ -651,36 +692,7 @@ int main(int ac, char **av) {
 					maxfd = connfd;
 				FD_SET(connfd, &live);
 				id[connfd] = next_id++;
-				sprintf(buf, "server: client %d just arrived\n", id[connfd]);
-				broadcast(connfd, buf);
-			}
-			else
-			{
-				int n = recv(fd, buf, sizeof(buf) - 1, 0);
-				if (n <= 0)
-				{
-					FD_CLR(fd, &live);
-					sprintf(buf, "server: client %d just left\n", id[fd]);
-					broadcast(fd, buf);
-					close(fd);
-					free(in[fd]);
-					free(out[fd]);
-					in[fd] = out[fd] = NULL;
-					continue;
-				}
-				buf[n] = 0;
-				in[fd] = str_join(in[fd], buf);
-				if (!in[fd])
-					fatal();
-				while ((n = extract_message(&in[fd], &msg)) > 0)
-				{
-					sprintf(buf, "client %d: ", id[fd]);
-					broadcast(fd, buf);
-					broadcast(fd, msg);
-					free(msg);
-				}
-				if (n < 0)
-					fatal();
+				notice(connfd, "server: client %d just arrived\n");
 			}
 		}
 	}
@@ -689,4 +701,4 @@ int main(int ac, char **av) {
 
 ## 検証状況・制約
 
-この文書の置換手順を機械的に適用すると、現在の GitHub の mini_serv_from_given.c と完全一致することを確認済み。今回の更新は Markdown のみで、Cソースの再コンパイル・通信テスト・公式テスター実行はしていない。上のテストを実際の環境で実行して確認すること。文字列連結のコピーコストや Linux 固有の send フラグは従来の解答と同じ。
+ローカルの短縮版で cc -Wall -Wextra -Werror、引数なし、bind エラー、3クライアント、複数行、分割受信、切断、再接続、約4 MiBの低速クライアント向け配信を確認。公式テスターは未実施。Linux の MSG_DONTWAIT / MSG_NOSIGNAL を使用する。文字列連結によるコピーコストは残る。
